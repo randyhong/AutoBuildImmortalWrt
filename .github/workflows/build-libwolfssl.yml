@@ -1,0 +1,245 @@
+name: Cross-compile wolfSSL for ImmortalWrt
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  release:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      wolfssl_version:
+        description: 'wolfSSL version to build'
+        required: true
+        default: 'v5.8.0-stable'
+        type: string
+
+env:
+  WOLFSSL_VERSION: ${{ inputs.wolfssl_version || 'v5.8.0-stable' }}
+
+jobs:
+  cross-compile:
+    name: Cross-compile wolfSSL
+    runs-on: ubuntu-latest
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - arch: "mips"
+            triple: "mips-openwrt-linux-musl"
+            toolchain: "mips_24kc"
+            platform: "ramips/mt7620"
+          - arch: "mipsel" 
+            triple: "mipsel-openwrt-linux-musl"
+            toolchain: "mipsel_24kc"
+            platform: "ramips/mt76x8"
+          - arch: "arm"
+            triple: "arm-openwrt-linux-muslgnueabi"
+            toolchain: "arm_cortex-a7_neon-vfpv4"
+            platform: "mediatek/mt7622"
+          - arch: "aarch64"
+            triple: "aarch64-openwrt-linux-musl"
+            toolchain: "aarch64_generic"
+            platform: "rockchip/armv8"
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up build environment
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential \
+          autoconf \
+          automake \
+          libtool \
+          pkg-config \
+          wget \
+          curl \
+          git \
+          file \
+          unzip
+
+    - name: Download wolfSSL source
+      run: |
+        git clone --depth 1 --branch ${WOLFSSL_VERSION} https://github.com/wolfSSL/wolfssl.git
+        cd wolfssl
+        ./autogen.sh
+
+    - name: Download and setup cross-compilation toolchain
+      run: |
+        # 下载ImmortalWrt/OpenWrt交叉编译工具链
+        TOOLCHAIN_URL="https://downloads.immortalwrt.org/releases/23.05.2/targets/${{ matrix.target.platform }}/immortalwrt-toolchain-23.05.2-${{ matrix.target.platform }}.Linux-x86_64.tar.xz"
+        
+        wget -O toolchain.tar.xz "$TOOLCHAIN_URL" || {
+          echo "Failed to download toolchain, trying OpenWrt..."
+          OPENWRT_URL="https://downloads.openwrt.org/releases/23.05.2/targets/${{ matrix.target.platform }}/openwrt-toolchain-23.05.2-${{ matrix.target.platform }}.Linux-x86_64.tar.xz"
+          wget -O toolchain.tar.xz "$OPENWRT_URL"
+        }
+        
+        tar -xf toolchain.tar.xz
+        TOOLCHAIN_DIR=$(find . -maxdepth 1 -name "*toolchain*" -type d)
+        echo "TOOLCHAIN_PATH=$(pwd)/$TOOLCHAIN_DIR" >> $GITHUB_ENV
+
+    - name: Configure cross-compilation environment
+      run: |
+        export PATH="$TOOLCHAIN_PATH/bin:$PATH"
+        
+        # 设置交叉编译环境变量
+        echo "CC=${{ matrix.target.triple }}-gcc" >> $GITHUB_ENV
+        echo "CXX=${{ matrix.target.triple }}-g++" >> $GITHUB_ENV
+        echo "AR=${{ matrix.target.triple }}-ar" >> $GITHUB_ENV
+        echo "RANLIB=${{ matrix.target.triple }}-ranlib" >> $GITHUB_ENV
+        echo "STRIP=${{ matrix.target.triple }}-strip" >> $GITHUB_ENV
+        echo "LD=${{ matrix.target.triple }}-ld" >> $GITHUB_ENV
+        echo "CROSS_COMPILE=${{ matrix.target.triple }}-" >> $GITHUB_ENV
+        echo "PATH=$TOOLCHAIN_PATH/bin:$PATH" >> $GITHUB_ENV
+
+    - name: Configure wolfSSL build
+      working-directory: wolfssl
+      run: |
+        export PATH="$TOOLCHAIN_PATH/bin:$PATH"
+        
+        ./configure \
+          --host=${{ matrix.target.triple }} \
+          --prefix=/usr \
+          --enable-static \
+          --enable-shared \
+          --enable-opensslextra \
+          --enable-opensslall \
+          --enable-secure-renegotiation \
+          --enable-supportedcurves \
+          --enable-tlsext \
+          --enable-fortress \
+          --enable-fastmath \
+          --enable-aesni \
+          --enable-ecc \
+          --enable-aesgcm \
+          --enable-chacha \
+          --enable-poly1305 \
+          --enable-sha3 \
+          --enable-curve25519 \
+          --enable-ed25519 \
+          --disable-examples \
+          --disable-crypttests \
+          CC=${{ matrix.target.triple }}-gcc \
+          CXX=${{ matrix.target.triple }}-g++ \
+          AR=${{ matrix.target.triple }}-ar \
+          RANLIB=${{ matrix.target.triple }}-ranlib \
+          STRIP=${{ matrix.target.triple }}-strip \
+          CFLAGS="-Os -pipe -ffunction-sections -fdata-sections" \
+          CXXFLAGS="-Os -pipe -ffunction-sections -fdata-sections" \
+          LDFLAGS="-Wl,--gc-sections"
+
+    - name: Build wolfSSL
+      working-directory: wolfssl
+      run: |
+        export PATH="$TOOLCHAIN_PATH/bin:$PATH"
+        make -j$(nproc)
+        make DESTDIR=$PWD/install install
+
+    - name: Create package
+      working-directory: wolfssl
+      run: |
+        export PATH="$TOOLCHAIN_PATH/bin:$PATH"
+        
+        # 创建包目录结构
+        mkdir -p package/usr/lib
+        mkdir -p package/usr/include
+        
+        # 复制库文件
+        cp -av install/usr/lib/* package/usr/lib/
+        cp -av install/usr/include/* package/usr/include/
+        
+        # 去除调试信息
+        find package -name "*.so*" -exec ${{ matrix.target.triple }}-strip --strip-unneeded {} \;
+        find package -name "*.a" -exec ${{ matrix.target.triple }}-strip --strip-debug {} \;
+        
+        # 创建tarball
+        cd package
+        tar -czf ../wolfssl-${WOLFSSL_VERSION}-${{ matrix.target.arch }}.tar.gz .
+        cd ..
+        
+        # 显示文件信息
+        ls -la wolfssl-${WOLFSSL_VERSION}-${{ matrix.target.arch }}.tar.gz
+        file package/usr/lib/libwolfssl.so* || true
+
+    - name: Generate build info
+      working-directory: wolfssl
+      run: |
+        export PATH="$TOOLCHAIN_PATH/bin:$PATH"
+        
+        echo "## Build Information for ${{ matrix.target.arch }}" > build-info-${{ matrix.target.arch }}.md
+        echo "- wolfSSL Version: ${WOLFSSL_VERSION}" >> build-info-${{ matrix.target.arch }}.md
+        echo "- Target Architecture: ${{ matrix.target.arch }}" >> build-info-${{ matrix.target.arch }}.md
+        echo "- Target Triple: ${{ matrix.target.triple }}" >> build-info-${{ matrix.target.arch }}.md
+        echo "- Platform: ${{ matrix.target.platform }}" >> build-info-${{ matrix.target.arch }}.md
+        echo "- Build Date: $(date)" >> build-info-${{ matrix.target.arch }}.md
+        echo "- Commit: $(git rev-parse HEAD)" >> build-info-${{ matrix.target.arch }}.md
+        echo "" >> build-info-${{ matrix.target.arch }}.md
+        echo "### File Information:" >> build-info-${{ matrix.target.arch }}.md
+        echo '```
+        ls -la wolfssl-${WOLFSSL_VERSION}-${{ matrix.target.arch }}.tar.gz >> build-info-${{ matrix.target.arch }}.md
+        echo '```' >> build-info-${{ matrix.target.arch }}.md
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: wolfssl-${{ matrix.target.arch }}-${{ env.WOLFSSL_VERSION }}
+        path: |
+          wolfssl/wolfssl-${{ env.WOLFSSL_VERSION }}-${{ matrix.target.arch }}.tar.gz
+          wolfssl/build-info-${{ matrix.target.arch }}.md
+        retention-days: 30
+
+  create-release:
+    name: Create Release
+    needs: cross-compile
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+
+    - name: Prepare release assets
+      run: |
+        mkdir release-assets
+        find artifacts -name "*.tar.gz" -exec cp {} release-assets/ \;
+        find artifacts -name "*.md" -exec cp {} release-assets/ \;
+        ls -la release-assets/
+
+    - name: Upload release assets
+      uses: softprops/action-gh-release@v1
+      with:
+        files: release-assets/*
+        body: |
+          ## wolfSSL ${{ env.WOLFSSL_VERSION }} Cross-compiled Libraries
+          
+          This release contains cross-compiled wolfSSL libraries for various ImmortalWrt/OpenWrt architectures:
+          
+          - **mips**: MIPS 24Kc for ramips/mt7620 platform
+          - **mipsel**: MIPS 24Kc Little Endian for ramips/mt76x8 platform  
+          - **arm**: ARM Cortex-A7 with NEON for mediatek/mt7622 platform
+          - **aarch64**: ARM64 generic for rockchip/armv8 platform
+          
+          ### Usage Instructions
+          
+          1. Download the appropriate `.tar.gz` file for your target architecture
+          2. Extract to your ImmortalWrt build environment
+          3. Copy libraries to `/usr/lib` and headers to `/usr/include`
+          
+          ### Build Configuration
+          
+          Libraries are built with the following features enabled:
+          - OpenSSL compatibility layer
+          - ECC, AES-GCM, ChaCha20, Poly1305
+          - TLS 1.3, Curve25519, Ed25519
+          - SHA-3 support
+          
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
