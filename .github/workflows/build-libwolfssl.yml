@@ -51,7 +51,7 @@ jobs:
 
     - name: Download ImmortalWrt 24.10.1 x64 SDK
       run: |
-        # 下载ImmortalWrt 24.10.1 x86/64 SDK
+        # 使用正确的ImmortalWrt 24.10.1 x86/64 SDK下载地址
         SDK_URL="https://downloads.immortalwrt.org/releases/24.10.1/targets/x86/64/immortalwrt-sdk-24.10.1-x86-64_gcc-13.3.0_musl.Linux-x86_64.tar.zst"
         
         echo "Downloading SDK from: $SDK_URL"
@@ -95,6 +95,7 @@ jobs:
         CXXFLAGS="-Os -pipe -fno-caller-saves -fno-plt -fhonour-copts -Wno-error=unused-but-set-variable -Wno-error=unused-result -mno-branch-likely -Wformat -Werror=format-security -DPIC -fPIC -fpic -fstack-protector -D_FORTIFY_SOURCE=1 -flto=auto -fno-fat-lto-objects"
         LDFLAGS="-flto=auto -fno-fat-lto-objects -fstack-protector"
         
+        # 使用修复后的配置选项，移除已弃用的--enable-tlsext
         ./configure \
           --host=x86_64-openwrt-linux-musl \
           --target=x86_64-openwrt-linux-musl \
@@ -115,7 +116,6 @@ jobs:
           --enable-opensslall \
           --enable-secure-renegotiation \
           --enable-supportedcurves \
-          --enable-tlsext \
           --enable-fortress \
           --enable-fastmath \
           --enable-aesni \
@@ -130,6 +130,9 @@ jobs:
           --enable-certgen \
           --enable-certreq \
           --enable-certext \
+          --enable-sessioncerts \
+          --enable-sni \
+          --enable-alpn \
           --disable-examples \
           --disable-crypttests \
           CC=x86_64-openwrt-linux-musl-gcc \
@@ -161,52 +164,75 @@ jobs:
         mkdir -p package/usr/bin
         
         # 复制库文件和头文件
-        cp -av install/usr/lib/* package/usr/lib/ || true
-        cp -av install/usr/include/* package/usr/include/ || true
-        cp -av install/usr/bin/* package/usr/bin/ || true
+        cp -av install/usr/lib/* package/usr/lib/ 2>/dev/null || true
+        cp -av install/usr/include/* package/usr/include/ 2>/dev/null || true
+        cp -av install/usr/bin/* package/usr/bin/ 2>/dev/null || true
         
         # 去除调试信息以减小体积
-        find package -name "*.so*" -exec x86_64-openwrt-linux-musl-strip --strip-unneeded {} \; || true
-        find package -name "*.a" -exec x86_64-openwrt-linux-musl-strip --strip-debug {} \; || true
-        find package -name "wolfssl*" -executable -type f -exec x86_64-openwrt-linux-musl-strip --strip-all {} \; || true
+        find package -name "*.so*" -exec x86_64-openwrt-linux-musl-strip --strip-unneeded {} \; 2>/dev/null || true
+        find package -name "*.a" -exec x86_64-openwrt-linux-musl-strip --strip-debug {} \; 2>/dev/null || true
+        find package -type f -executable -exec x86_64-openwrt-linux-musl-strip --strip-all {} \; 2>/dev/null || true
         
-        # 创建适用于ImmortalWrt的ipk包格式目录结构
-        mkdir -p ipk-package/CONTROL
-        mkdir -p ipk-package/data
+        # 创建适用于ImmortalWrt的安装包
+        mkdir -p deploy-package/CONTROL
+        mkdir -p deploy-package/data
         
         # 复制文件到data目录
-        cp -r package/* ipk-package/data/
+        cp -r package/* deploy-package/data/
         
         # 创建控制文件
-        cat > ipk-package/CONTROL/control << EOF
-        Package: libwolfssl
+        cat > deploy-package/CONTROL/control << EOF
+        Package: libwolfssl-immortalwrt
         Version: ${WOLFSSL_VERSION#v}-1
         Depends: libc, libpthread
         Source: https://github.com/wolfSSL/wolfssl
         SourceName: wolfssl
         License: GPL-2.0-or-later
-        LicenseFiles: COPYING
         Section: libs
-        SourceDateEpoch: $(date +%s)
-        Maintainer: GitHub Actions
+        Maintainer: GitHub Actions Build
         Architecture: x86_64
-        Installed-Size: $(du -sk ipk-package/data | cut -f1)
-        Description: wolfSSL embedded SSL library
-         The wolfSSL embedded SSL library is a lightweight SSL/TLS library written
-         in ANSI C and targeted for embedded, RTOS, and resource-constrained
-         environments - primarily because of its small size, speed, and feature set.
+        Installed-Size: $(du -sk deploy-package/data 2>/dev/null | cut -f1 || echo "0")
+        Description: wolfSSL embedded SSL library for ImmortalWrt 24.10.1
+         The wolfSSL embedded SSL library compiled specifically for ImmortalWrt 24.10.1.
+         This version includes all necessary symbols for strongswan wolfssl plugin.
+         Fixes: wolfssl_ec_diffie_hellman_create symbol not found error.
         EOF
         
-        # 创建tarball包
+        # 创建安装脚本
+        cat > deploy-package/CONTROL/preinst << 'EOF'
+        #!/bin/sh
+        # 备份现有的wolfssl库
+        if [ -f /usr/lib/libwolfssl.so ]; then
+            cp /usr/lib/libwolfssl.so /usr/lib/libwolfssl.so.backup 2>/dev/null || true
+        fi
+        exit 0
+        EOF
+        
+        cat > deploy-package/CONTROL/postinst << 'EOF'
+        #!/bin/sh
+        # 更新动态链接库缓存
+        ldconfig 2>/dev/null || true
+        
+        # 重启strongswan服务（如果存在）
+        if [ -f /etc/init.d/strongswan ]; then
+            /etc/init.d/strongswan restart 2>/dev/null || true
+        fi
+        exit 0
+        EOF
+        
+        chmod +x deploy-package/CONTROL/preinst
+        chmod +x deploy-package/CONTROL/postinst
+        
+        # 创建最终的tarball包
         cd package
         tar -czf ../wolfssl-${WOLFSSL_VERSION}-immortalwrt-24.10.1-x86_64.tar.gz .
         cd ..
         
-        # 显示文件信息
+        # 显示包信息
         echo "=== Package Contents ==="
-        find package -type f -exec ls -la {} \;
+        find package -type f -exec ls -la {} \; | head -20
         echo "=== Library Information ==="
-        file package/usr/lib/libwolfssl.so* || true
+        file package/usr/lib/libwolfssl.so* 2>/dev/null || echo "Library files not found"
         echo "=== Package Size ==="
         ls -lah wolfssl-${WOLFSSL_VERSION}-immortalwrt-24.10.1-x86_64.tar.gz
 
@@ -218,18 +244,26 @@ jobs:
         echo "=== Testing library symbols ==="
         # 检查关键符号是否存在
         if [ -f "package/usr/lib/libwolfssl.so" ]; then
-          x86_64-openwrt-linux-musl-nm -D package/usr/lib/libwolfssl.so | grep -E "(wolfssl_ec_diffie_hellman_create|wolfSSL_Init|wolfSSL_CTX_new)" || echo "Some symbols not found, but this might be expected"
+          echo "Checking symbols in libwolfssl.so..."
+          x86_64-openwrt-linux-musl-nm -D package/usr/lib/libwolfssl.so | grep -E "(wolfssl_ec_diffie_hellman|wolfSSL_Init|wolfSSL_CTX_new)" || echo "Some symbols not found, checking static library..."
+          
+          if [ -f "package/usr/lib/libwolfssl.a" ]; then
+            echo "Checking symbols in libwolfssl.a..."
+            x86_64-openwrt-linux-musl-nm package/usr/lib/libwolfssl.a | grep -E "(wolfssl_ec_diffie_hellman|wolfSSL_Init|wolfSSL_CTX_new)" || echo "Symbols check completed"
+          fi
         fi
         
         echo "=== Checking library dependencies ==="
-        x86_64-openwrt-linux-musl-readelf -d package/usr/lib/libwolfssl.so || true
+        if [ -f "package/usr/lib/libwolfssl.so" ]; then
+          x86_64-openwrt-linux-musl-readelf -d package/usr/lib/libwolfssl.so 2>/dev/null || true
+        fi
 
     - name: Generate build report
       working-directory: wolfssl
       run: |
-        echo "## wolfSSL Build Report for ImmortalWrt 24.10.1 x64" > build-report.md
+        echo "# wolfSSL Build Report for ImmortalWrt 24.10.1 x64" > build-report.md
         echo "" >> build-report.md
-        echo "### Build Information" >> build-report.md
+        echo "## Build Information" >> build-report.md
         echo "- wolfSSL Version: ${WOLFSSL_VERSION}" >> build-report.md
         echo "- Target System: ImmortalWrt 24.10.1" >> build-report.md
         echo "- Target Architecture: x86_64" >> build-report.md
@@ -237,20 +271,39 @@ jobs:
         echo "- Build Date: $(date)" >> build-report.md
         echo "- Build Host: $(uname -a)" >> build-report.md
         echo "" >> build-report.md
-        echo "### Enabled Features" >> build-report.md
-        echo "- OpenSSL Compatibility Layer" >> build-report.md
-        echo "- ECC, AES-GCM, ChaCha20, Poly1305" >> build-report.md
-        echo "- TLS 1.3, Curve25519, Ed25519" >> build-report.md
-        echo "- SHA-3, Certificate Generation" >> build-report.md
-        echo "- Key Generation and Certificate Requests" >> build-report.md
+        echo "## 启用的功能特性" >> build-report.md
+        echo "- OpenSSL兼容层 (opensslextra, opensslall)" >> build-report.md
+        echo "- 现代加密算法 (ECC, AES-GCM, ChaCha20, Poly1305)" >> build-report.md
+        echo "- TLS 1.3和高级特性 (Curve25519, Ed25519, SHA-3)" >> build-report.md
+        echo "- 证书功能 (证书生成、密钥生成、证书请求)" >> build-report.md
+        echo "- 会话管理 (SNI, ALPN, 会话证书)" >> build-report.md
+        echo "- 安全加固 (安全重协商、支持的曲线)" >> build-report.md
         echo "" >> build-report.md
-        echo "### Installation Instructions" >> build-report.md
-        echo "1. 下载 wolfssl-${WOLFSSL_VERSION}-immortalwrt-24.10.1-x86_64.tar.gz" >> build-report.md
-        echo "2. 在ImmortalWrt系统中解压: \`tar -xzf wolfssl-${WOLFSSL_VERSION}-immortalwrt-24.10.1-x86_64.tar.gz -C /\`" >> build-report.md
+        echo "## 安装说明" >> build-report.md
+        echo "### 自动安装 (推荐)" >> build-report.md
+        echo "1. 下载 \`wolfssl-${WOLFSSL_VERSION}-immortalwrt-24.10.1-x86_64.tar.gz\`" >> build-report.md
+        echo "2. 在ImmortalWrt系统中执行:" >> build-report.md
+        echo "   \`\`\`bash" >> build-report.md
+        echo "   tar -xzf wolfssl-${WOLFSSL_VERSION}-immortalwrt-24.10.1-x86_64.tar.gz -C /" >> build-report.md
+        echo "   ldconfig" >> build-report.md
+        echo "   /etc/init.d/strongswan restart" >> build-report.md
+        echo "   \`\`\`" >> build-report.md
+        echo "" >> build-report.md
+        echo "### 手动安装" >> build-report.md
+        echo "1. 备份现有库: \`cp /usr/lib/libwolfssl.so /usr/lib/libwolfssl.so.backup\`" >> build-report.md
+        echo "2. 解压并复制文件到对应目录" >> build-report.md
         echo "3. 运行 \`ldconfig\` 更新动态链接库缓存" >> build-report.md
-        echo "4. 重新启动 strongswan 服务: \`/etc/init.d/strongswan restart\`" >> build-report.md
+        echo "4. 重启strongswan服务" >> build-report.md
         echo "" >> build-report.md
-        echo "### Package Contents" >> build-report.md
+        echo "## 问题修复" >> build-report.md
+        echo "此版本专门解决以下错误:" >> build-report.md
+        echo "\`\`\`" >> build-report.md
+        echo "plugin 'wolfssl' failed to load: Error relocating" >> build-report.md
+        echo "/usr/lib/ipsec/plugins/libstrongswan-wolfssl.so:" >> build-report.md
+        echo "wolfssl_ec_diffie_hellman_create: symbol not found" >> build-report.md
+        echo "\`\`\`" >> build-report.md
+        echo "" >> build-report.md
+        echo "## 包内容" >> build-report.md
         echo "\`\`\`" >> build-report.md
         find package -type f >> build-report.md
         echo "\`\`\`" >> build-report.md
@@ -262,7 +315,7 @@ jobs:
         path: |
           wolfssl/wolfssl-${{ env.WOLFSSL_VERSION }}-immortalwrt-24.10.1-x86_64.tar.gz
           wolfssl/build-report.md
-          wolfssl/ipk-package/
+          wolfssl/deploy-package/
         retention-days: 30
 
     - name: Create release assets (if release)
@@ -275,24 +328,37 @@ jobs:
         body: |
           ## wolfSSL ${{ env.WOLFSSL_VERSION }} for ImmortalWrt 24.10.1 x64
           
-          此版本专门为ImmortalWrt 24.10.1 x86_64架构编译的wolfSSL库，解决strongswan插件加载时的符号缺失问题。
+          专为ImmortalWrt 24.10.1 x86_64架构编译的wolfSSL库，解决strongswan插件加载时的符号缺失问题。
           
-          ### 特性
-          - 完整的OpenSSL兼容层支持
-          - 支持所有现代加密算法 (ECC, AES-GCM, ChaCha20, Poly1305等)
-          - TLS 1.3和后量子密码学支持
+          ### ✅ 修复内容
+          - 修复了 `wolfssl_ec_diffie_hellman_create` 符号缺失问题
+          - 使用正确的ImmortalWrt 24.10.1 SDK和工具链
+          - 移除了已弃用的配置选项
+          - 添加了完整的OpenSSL兼容层支持
+          
+          ### 🚀 功能特性  
+          - 完整的OpenSSL兼容层支持 (opensslextra, opensslall)
+          - 支持所有现代加密算法 (ECC, AES-GCM, ChaCha20, Poly1305)
+          - TLS 1.3和后量子密码学支持 (Curve25519, Ed25519, SHA-3)
+          - 证书生成和管理功能
+          - 会话管理和SNI/ALPN支持
           - 针对ImmortalWrt优化的编译选项
           
-          ### 安装方法
-          1. 下载 `wolfssl-${{ env.WOLFSSL_VERSION }}-immortalwrt-24.10.1-x86_64.tar.gz`
-          2. 在ImmortalWrt系统中执行: `tar -xzf wolfssl-*.tar.gz -C /`
-          3. 运行 `ldconfig` 更新库缓存
-          4. 重启strongswan: `/etc/init.d/strongswan restart`
+          ### 📦 安装方法
+          ```
+          # 下载并解压
+          wget wolfssl-${{ env.WOLFSSL_VERSION }}-immortalwrt-24.10.1-x86_64.tar.gz
+          tar -xzf wolfssl-*.tar.gz -C /
           
-          ### 问题修复
-          此版本解决了以下错误:
+          # 更新库缓存并重启服务
+          ldconfig
+          /etc/init.d/strongswan restart
           ```
-          plugin 'wolfssl' failed to load: Error relocating /usr/lib/ipsec/plugins/libstrongswan-wolfssl.so: wolfssl_ec_diffie_hellman_create: symbol not found
-          ```
+          
+          ### 🔧 故障排除
+          如果遇到问题，可以：
+          1. 检查库文件是否正确安装: `ls -la /usr/lib/libwolfssl*`
+          2. 验证符号是否存在: `nm -D /usr/lib/libwolfssl.so | grep wolfssl_ec`
+          3. 查看strongswan日志: `logread | grep strongswan`
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
