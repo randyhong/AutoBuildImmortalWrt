@@ -1,6 +1,10 @@
 name: Cross-compile wolfSSL for ImmortalWrt 24.10.1 x64
 
 on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
   workflow_dispatch:
     inputs:
       wolfssl_version:
@@ -17,74 +21,77 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout 源码
-        uses: actions/checkout@v4
+    - name: Checkout 源码
+      uses: actions/checkout@v4
 
-      - name: 安装依赖
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential autoconf automake libtool \
-          pkg-config wget curl git file unzip zstd xz-utils zlib1g-dev libltdl-dev [1]
+    - name: 安装依赖
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential autoconf automake libtool \
+          pkg-config wget curl git file unzip \
+          zstd xz-utils zlib1g-dev libltdl-dev [1]
 
-      - name: 下载并准备 wolfSSL 源码
-        run: |
-          git clone --depth 1 --branch ${WOLFSSL_VERSION} https://github.com/wolfSSL/wolfssl.git
-          cd wolfssl
-          ./autogen.sh [2]
+    - name: 获取 wolfSSL 源码
+      run: |
+        git clone --depth 1 --branch ${WOLFSSL_VERSION} https://github.com/wolfSSL/wolfssl.git
+        cd wolfssl
+        ./autogen.sh [2]
 
-      - name: 下载 ImmortalWrt SDK
-        run: |
-          SDK_URL="https://downloads.immortalwrt.org/releases/24.10.1/targets/x86/64/immortalwrt-sdk-24.10.1-x86-64_gcc-13.3.0_musl.Linux-x86_64.tar.zst"
-          wget -O sdk.tar.zst $SDK_URL
-          tar -I zstd -xf sdk.tar.zst
-          echo "SDK_PATH=$(find . -maxdepth 1 -type d -name 'immortalwrt-sdk*')" >> $GITHUB_ENV [3]
+    - name: 下载 ImmortalWrt SDK
+      run: |
+        SDK_URL="https://downloads.immortalwrt.org/releases/24.10.1/targets/x86/64/immortalwrt-sdk-24.10.1-x86-64_gcc-13.3.0_musl.Linux-x86_64.tar.zst"
+        wget -O sdk.tar.zst $SDK_URL
+        tar -I zstd -xf sdk.tar.zst
+        echo "SDK_PATH=$(find . -maxdepth 1 -type d -name 'immortalwrt-sdk*')" >> $GITHUB_ENV [3]
 
-      - name: 设置交叉编译工具链
-        run: |
-          cd $SDK_PATH
-          TOOLCHAIN=$(find staging_dir -maxdepth 1 -type d -name "toolchain*")
-          echo "TOOLCHAIN_PATH=$PWD/$TOOLCHAIN" >> $GITHUB_ENV
-          echo "PATH=$PWD/$TOOLCHAIN/bin:$PATH" >> $GITHUB_ENV
-          echo "CC=x86_64-openwrt-linux-musl-gcc" >> $GITHUB_ENV
-          echo "AR=x86_64-openwrt-linux-musl-ar" >> $GITHUB_ENV
-          echo "RANLIB=x86_64-openwrt-linux-musl-ranlib" >> $GITHUB_ENV
-          echo "STRIP=x86_64-openwrt-linux-musl-strip" >> $GITHUB_ENV [4]
+    - name: 设置交叉编译工具链
+      run: |
+        cd $SDK_PATH
+        TOOLCHAIN=$(find staging_dir -maxdepth 1 -type d -name "toolchain*")
+        echo "TOOLCHAIN_PATH=$PWD/$TOOLCHAIN" >> $GITHUB_ENV
+        echo "PATH=$PWD/$TOOLCHAIN/bin:$PATH" >> $GITHUB_ENV
+        echo "CC=x86_64-openwrt-linux-musl-gcc" >> $GITHUB_ENV
+        echo "AR=x86_64-openwrt-linux-musl-ar" >> $GITHUB_ENV
+        echo "RANLIB=x86_64-openwrt-linux-musl-ranlib" >> $GITHUB_ENV
+        echo "STRIP=x86_64-openwrt-linux-musl-strip" >> $GITHUB_ENV [4]
 
-      - name: 配置 wolfSSL（生成 .so 与 .a）
-        working-directory: wolfssl
-        run: |
-          export PATH="$TOOLCHAIN_PATH/bin:$PATH"
-          ./configure \
-            --host=x86_64-openwrt-linux-musl \
-            --prefix=/usr \
-            --enable-shared \
-            --enable-static \
-            --disable-examples \
-            --disable-crypttests \
-            CC=$CC AR=$AR RANLIB=$RANLIB \
-            CFLAGS="-Os -pipe -fPIC" LDFLAGS="-fPIC" [5]
+    - name: 配置 wolfSSL（同时生成 .a 与 .so）
+      working-directory: wolfssl
+      run: |
+        export PATH="$TOOLCHAIN_PATH/bin:$PATH"
+        ./configure \
+          --host=x86_64-openwrt-linux-musl \
+          --prefix=/usr \
+          --enable-static \
+          --enable-shared \
+          --disable-examples \
+          --disable-crypttests \
+          CC=$CC AR=$AR RANLIB=$RANLIB \
+          CFLAGS="-Os -pipe -fPIC" LDFLAGS="-fPIC" [5]
 
-      - name: 编译并安装
-        working-directory: wolfssl
-        run: |
-          export PATH="$TOOLCHAIN_PATH/bin:$PATH"
-          make -j$(nproc)
-          make DESTDIR=$PWD/install install [6]
+    - name: 编译并安装
+      working-directory: wolfssl
+      run: |
+        export PATH="$TOOLCHAIN_PATH/bin:$PATH"
+        make -j$(nproc)
+        make DESTDIR=$PWD/install install [6]
 
-      - name: 验证动态库
-        run: |
-          ls install/usr/lib/libwolfssl.so* || exit 1
-          x86_64-openwrt-linux-musl-readelf -Ws install/usr/lib/libwolfssl.so \
-            | grep wolfssl_ec_diffie_hellman_create [7]
+    - name: 验证动态库输出
+      run: |
+        ls install/usr/lib/libwolfssl.so* || exit 1
+        x86_64-openwrt-linux-musl-readelf -Ws install/usr/lib/libwolfssl.so \
+          | grep wolfssl_ec_diffie_hellman_create [7]
 
-      - name: 打包产物
-        run: |
-          mkdir -p artifacts/lib
-          cp install/usr/lib/libwolfssl.so* artifacts/lib/
-          tar -czf wolfssl-${WOLFSSL_VERSION}-x86_64.tar.gz -C artifacts lib [8]
+    - name: 打包产物
+      run: |
+        mkdir -p artifacts/lib
+        cp install/usr/lib/libwolfssl.so* artifacts/lib/
+        cp install/usr/lib/libwolfssl.a artifacts/lib/
+        tar -czf wolfssl-${WOLFSSL_VERSION}-x86_64.tar.gz -C artifacts lib [8]
 
-      - name: 上传产物
-        uses: actions/upload-artifact@v4
-        with:
-          name: wolfssl-${WOLFSSL_VERSION}-x86_64
-          path: wolfssl-${WOLFSSL_VERSION}-x86_64.tar.gz [9]
+    - name: 上传产物
+      uses: actions/upload-artifact@v4
+      with:
+        name: wolfssl-${WOLFSSL_VERSION}-x86_64
+        path: wolfssl-${WOLFSSL_VERSION}-x86_64.tar.gz [9]
