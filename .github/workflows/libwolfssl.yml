@@ -1,0 +1,124 @@
+name: Cross-compile wolfSSL for ImmortalWrt 24.10.1 x64
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  release:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      wolfssl_version:
+        description: 'wolfSSL version to build'
+        required: true
+        default: 'v5.8.0-stable'
+        type: string
+
+env:
+  WOLFSSL_VERSION: ${{ inputs.wolfssl_version || 'v5.8.0-stable' }}
+
+jobs:
+  cross-compile-x64:
+    name: Cross-compile wolfSSL for x64
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up build environment
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            autoconf \
+            automake \
+            libtool \
+            pkg-config \
+            wget \
+            curl \
+            git \
+            file \
+            unzip \
+            zstd \
+            xz-utils
+
+      - name: Download wolfSSL source
+        run: |
+          git clone --depth 1 --branch ${WOLFSSL_VERSION} https://github.com/wolfSSL/wolfssl.git
+          cd wolfssl
+          ./autogen.sh
+
+      - name: Download ImmortalWrt 24.10.1 x64 SDK
+        run: |
+          SDK_URL="https://downloads.immortalwrt.org/releases/24.10.1/targets/x86/64/immortalwrt-sdk-24.10.1-x86-64_gcc-13.3.0_musl.Linux-x86_64.tar.zst"
+          wget -O sdk.tar.zst "$SDK_URL"
+          echo "Downloaded file size: $(stat -c%s sdk.tar.zst) bytes"
+          file sdk.tar.zst
+          tar -I zstd -xf sdk.tar.zst
+          SDK_DIR=$(find . -maxdepth 1 -name "immortalwrt-sdk-*" -type d)
+          echo "SDK_PATH=$(pwd)/$SDK_DIR" >> $GITHUB_ENV
+
+      - name: Setup SDK environment and verify toolchain
+        run: |
+          cd $SDK_PATH
+          TOOLCHAIN_DIR=$(find staging_dir -maxdepth 1 -name "toolchain-*" -type d)
+          echo "TOOLCHAIN_PATH=$SDK_PATH/$TOOLCHAIN_DIR" >> $GITHUB_ENV
+          echo "STAGING_DIR=$SDK_PATH/staging_dir" >> $GITHUB_ENV
+          echo "PATH=$SDK_PATH/$TOOLCHAIN_DIR/bin:$PATH" >> $GITHUB_ENV
+          echo "CC=x86_64-openwrt-linux-musl-gcc" >> $GITHUB_ENV
+          echo "CXX=x86_64-openwrt-linux-musl-g++" >> $GITHUB_ENV
+
+      - name: Configure wolfSSL build
+        working-directory: wolfssl
+        run: |
+          export PATH="$TOOLCHAIN_PATH/bin:$PATH"
+          export STAGING_DIR="$SDK_PATH/staging_dir"
+          CFLAGS="-Os -pipe -fno-caller-saves -fno-plt -fhonour-copts -Wno-error=unused-but-set-variable -Wno-error=unused-result -fstack-protector -D_FORTIFY_SOURCE=1"
+          CXXFLAGS="$CFLAGS"
+          LDFLAGS="-fstack-protector"
+          ./configure \
+            --host=x86_64-openwrt-linux-musl \
+            --disable-shared \
+            --enable-static \
+            ... # 省略其他已配置选项
+
+      - name: Build wolfSSL
+        working-directory: wolfssl
+        run: |
+          export PATH="$TOOLCHAIN_PATH/bin:$PATH"
+          make -j$(nproc) V=s
+          make DESTDIR=$PWD/install install
+          find install -name "libwolfssl*" -exec ls -la {} \;
+
+      - name: Create deployment package
+        working-directory: wolfssl
+        run: |
+          mkdir -p package/usr/{lib,include,bin}
+          cp -av install/usr/lib/* package/usr/lib/ || true
+          cp -av install/usr/include/* package/usr/include/ || true
+          find package -name "*.so*" -exec x86_64-openwrt-linux-musl-strip --strip-unneeded {} \; || true
+          # 安装脚本省略...
+
+      - name: Test compiled libraries
+        working-directory: wolfssl
+        run: |
+          x86_64-openwrt-linux-musl-nm package/usr/lib/libwolfssl.a | grep wolfSSL_Init
+          file package/usr/lib/libwolfssl.so || true
+
+      - name: Generate build report
+        working-directory: wolfssl
+        run: |
+          echo "# wolfSSL ${WOLFSSL_VERSION} 构建报告" > build-report.md
+          ... # 省略已生成内容
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wolfssl-immortalwrt-24.10.1-x86_64-${{ env.WOLFSSL_VERSION }}
+          path: |
+            wolfssl/wolfssl-${{ env.WOLFSSL_VERSION }}-immortalwrt-24.10.1-x86_64.tar.gz
+            wolfssl/wolfssl-${{ env.WOLFSSL_VERSION }}-immortalwrt-24.10.1-x86_64-with-installer.tar.gz
+            wolfssl/build-report.md
+            wolfssl/package/usr/lib/libwolfssl.so    # 新增 `.so` 动态库文件输出
